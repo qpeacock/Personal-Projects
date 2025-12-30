@@ -1,0 +1,221 @@
+import cv2
+import mediapipe as mp
+from mediapipe.tasks import python
+from mediapipe.tasks.python import vision
+from mediapipe.tasks.python.vision import RunningMode
+import pyautogui
+import os
+import time
+
+pyautogui.FAILSAFE = True
+pyautogui.PAUSE = 0.1
+cap = cv2.VideoCapture(0)
+#Variables
+pinch_start = None
+open_start = None
+dragging = False
+screen_width, screen_height = pyautogui.size()
+last_scroll_y = None
+
+#Functions
+def is_fist(hand_landmarks, img_shape):
+    h, w, _ = img_shape
+    # Check if tips of all fingers are below the MCP joints
+    tips_ids = [4, 8, 12, 16, 20]  # thumb, index, middle, ring, pinky tips
+    mcp_ids = [2, 5, 9, 13, 17]
+    fist = True
+    for tip, mcp in zip(tips_ids, mcp_ids):
+        if hand_landmarks[tip].y * h < hand_landmarks[mcp].y * h:
+            fist = False
+    return fist
+
+def is_point(hand_landmarks, img_shape):
+    h, w, _ = img_shape
+    tips_ids = [4, 8, 12, 16, 20]
+    pointing = True
+    for tip in tips_ids:
+        if hand_landmarks[tip].y * h < hand_landmarks[8].y *h:
+            pointing = False
+    return pointing
+
+def is_pinching(hand_landmarks, img_shape):
+    h, w, _ = img_shape
+    tips_ids = [4, 8]
+    pinch = False
+    for tip in tips_ids:
+        if abs(hand_landmarks[8].y * h - hand_landmarks[4].y * h) < 70 and abs(hand_landmarks[8].x * w - hand_landmarks[4].x * w) < 70:
+            pinch = True
+    return pinch
+
+def is_drag(hand_landmarks, img_shape):
+    h, _, _ = img_shape
+    margin = 25
+
+    index_y  = hand_landmarks[8].y * h
+    middle_y = hand_landmarks[12].y * h
+    ring_y   = hand_landmarks[16].y * h
+    pinky_y  = hand_landmarks[20].y * h
+
+    return (index_y + margin < ring_y and
+            index_y + margin < pinky_y and
+            middle_y + margin < ring_y and
+            middle_y + margin < pinky_y)
+
+def is_open(hand_landmarks, img_shape):
+    h, w, _ = img_shape
+    tips_ids = [4, 8, 12, 16, 20]
+    mcp_ids = [2, 5, 9, 13, 17]
+    fist = True
+    for tip, mcp in zip(tips_ids, mcp_ids):
+        if hand_landmarks[tip].y * h > hand_landmarks[mcp].y * h:
+            fist = False
+    return fist
+
+def fingerTrack(hand_landmarks, screen_width, screen_height):
+    x = hand_landmarks[8].x
+    y = hand_landmarks[8].y
+    adjusted_x = x*screen_width
+    adjusted_y = y*screen_height
+    return adjusted_x, adjusted_y
+
+def scroll(hand_landmarks, screen_width, screen_height):
+    global last_scroll_y
+    xIndex = hand_landmarks[8].x *screen_width
+    yIndex = hand_landmarks[8].y *screen_height
+    xMiddle = hand_landmarks[12].x *screen_width
+    yMiddle = hand_landmarks[12].y *screen_height
+    
+    close = (
+        abs(xIndex - xMiddle) < 60 and
+        abs(yIndex - yMiddle) < 60
+    )
+    if not close:
+        last_scroll_y = None
+        return 0
+
+    if last_scroll_y is None:
+        last_scroll_y = yIndex
+        return 0
+
+    delta = last_scroll_y - yIndex
+    last_scroll_y = yIndex
+    # dead zone
+    if abs(delta) < 12:
+        return 0
+
+    # clamp
+    delta = max(-40, min(40, delta))
+
+    # sensitivity scaling
+    return int(delta * 0.3)
+
+
+
+# Load hand landmarker model
+MODEL_PATH = os.path.join(
+    os.path.dirname(__file__),
+    "hand_landmarker.task"
+)
+
+base_options = python.BaseOptions(
+    model_asset_path=MODEL_PATH
+)
+
+
+options = vision.HandLandmarkerOptions(
+    base_options=base_options,
+    num_hands=1,
+    running_mode=RunningMode.VIDEO
+)
+
+#Loads the AI that detects hands
+with vision.HandLandmarker.create_from_options(options) as detector:
+
+    while True:
+        success, img = cap.read()
+        if not success:
+            print("Failed to grab frame")
+            break
+
+        img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB).copy()
+        mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=img_rgb)
+
+        timestamp_ms = int(time.time() * 1000)
+        result = detector.detect_for_video(mp_image, timestamp_ms)
+
+        # Draw landmarks
+        if result.hand_landmarks:
+            for hand_landmarks in result.hand_landmarks:
+                for lm in hand_landmarks:
+                    h, w, _ = img.shape
+                    cx, cy = int(lm.x * w), int(lm.y * h)
+                    cv2.circle(img, (cx, cy), 5, (0, 255, 0), -1)
+            print(f"Detected {len(result.hand_landmarks)} hand(s)")
+
+            #prints functions only when hands are detected
+            fist = is_fist(hand_landmarks, img.shape)
+            point = is_point(hand_landmarks, img.shape)
+            pinch = is_pinching(hand_landmarks, img.shape)
+            now = time.time()
+            isopen = is_open(hand_landmarks, img.shape)
+            isdrag = is_drag(hand_landmarks, img.shape)
+            scrollUp = scroll(hand_landmarks,screen_width, screen_height)
+
+            #Gesuture Actions
+            #Reset cursor
+            if isopen:
+                isdrag = False
+                if open_start is None:
+                    open_start = now  # start timing the palm
+                elif (now - open_start) > 2:
+                    pyautogui.moveTo(screen_width / 2, screen_height / 2)
+                    open_start = None 
+                    isdrag = False
+                    pinch = False
+                    point = False
+
+            else:
+                open_start = None 
+
+            #Scroll
+            if scrollUp != 0:
+                isdrag = False
+                pyautogui.mouseUp()
+                pyautogui.scroll(scrollUp)
+
+            #Draging
+            if isdrag:
+                point = False
+                x, y = fingerTrack(hand_landmarks, screen_width, screen_height)
+                if not dragging:
+                    pyautogui.mouseDown()  # start drag
+                    dragging = True
+                pyautogui.moveTo(screen_width - x, y)
+            else:
+                if dragging:
+                    pyautogui.mouseUp()  # release drag
+                    dragging = False
+
+            #Pinching
+            if pinch:
+                if pinch_start is None:
+                    pinch_start = now  # start timing the pinch
+                elif (now - pinch_start) > 0.5:  # pinch held for >0.3s
+                    pyautogui.click()
+                    pinch_start = None  # reset after action
+            else:
+                pinch_start = None  # reset if pinch is released
+
+            if point:
+                    x, y = fingerTrack(hand_landmarks, screen_width, screen_height)
+                    pyautogui.moveTo(screen_width - x, y)
+
+      
+            print(fist, point, pinch, isopen, isdrag)
+        img = cv2.flip(img, 1)
+        cv2.imshow("Camera", img)
+        if cv2.waitKey(1) & 0xFF == ord('q'):
+            break
+
+cap.release()
+cv2.destroyAllWindows()
